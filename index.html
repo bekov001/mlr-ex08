@@ -1,0 +1,250 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Leaf classifier — MLR ex08</title>
+<style>
+  :root { --bg:#f4f6f2; --card:#fff; --ink:#1b2a20; --muted:#617066; --line:#dce3da; --accent:#2e7a4c; }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 16px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    padding: calc(env(safe-area-inset-top) + 12px) 12px calc(env(safe-area-inset-bottom) + 24px);
+  }
+  main { max-width: 520px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  .sub { color: var(--muted); font-size: 13px; margin: 0 0 12px; }
+  #status { font-size: 13px; color: var(--muted); background: var(--card); border: 1px solid var(--line);
+            border-radius: 10px; padding: 8px 10px; margin-bottom: 12px; }
+  #status.err { color: #a3251f; }
+  /* Square stage: the video is cover-cropped, so what is visible is exactly the central square we classify. */
+  .stage { position: relative; width: 100%; aspect-ratio: 1 / 1; background: #101a13; border-radius: 14px; overflow: hidden; }
+  .stage video, .stage img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+  .stage .hint { position: absolute; inset: 0; display: grid; place-items: center; color: #cfdcd3; font-size: 14px; padding: 16px; text-align: center; }
+  .controls { display: flex; gap: 8px; margin: 12px 0; flex-wrap: wrap; }
+  button, .file { flex: 1 1 140px; min-height: 44px; font: inherit; border-radius: 10px; border: 1px solid var(--line);
+                  background: var(--card); color: var(--ink); padding: 10px 12px; text-align: center; cursor: pointer; }
+  button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+  button:disabled { opacity: .5; }
+  .file input { display: none; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 12px; margin-top: 12px; }
+  .row { display: grid; grid-template-columns: 80px 1fr 64px; gap: 8px; align-items: center; margin: 6px 0; font-size: 15px; }
+  .bar { height: 12px; background: #e6ece5; border-radius: 6px; overflow: hidden; }
+  .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .15s; }
+  .row.top { font-weight: 600; }
+  .num { text-align: right; font-variant-numeric: tabular-nums; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; font-variant-numeric: tabular-nums; }
+  td, th { border-bottom: 1px solid var(--line); padding: 4px 6px; text-align: right; }
+  td:first-child, th:first-child { text-align: left; }
+  .qr { display: flex; gap: 12px; align-items: center; }
+  .qr img { width: 132px; height: 132px; background: #fff; border-radius: 8px; padding: 6px; border: 1px solid var(--line); }
+  .qr a { word-break: break-all; font-size: 14px; }
+  small { color: var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Leaf classifier</h1>
+  <p class="sub">apple · cherry · chestnut · maple — MobileNetV3-Small, runs entirely in your browser (ONNX Runtime Web).</p>
+  <div id="status">Loading the model…</div>
+
+  <div class="stage" id="stage">
+    <video id="video" playsinline muted autoplay hidden></video>
+    <img id="photo" alt="uploaded photo" hidden>
+    <div class="hint" id="hint">Tap “Start camera” and fill the square with one leaf.</div>
+  </div>
+
+  <div class="controls">
+    <button class="primary" id="start" disabled>Start camera</button>
+    <button id="stop" disabled>Stop</button>
+    <label class="file">Upload photo<input type="file" id="upload" accept="image/*"></label>
+  </div>
+
+  <div class="card">
+    <strong>Probabilities</strong>
+    <div id="bars"></div>
+    <small id="timing"></small>
+  </div>
+
+  <div class="card">
+    <strong>Self-check: check_image.jpg</strong>
+    <p><small>Runs the bundled check image through this page and compares with the probabilities the notebook computed (check_expected.json).</small></p>
+    <button id="check" disabled>Run check</button>
+    <div id="checkOut"></div>
+  </div>
+
+  <div class="card">
+    <strong>Open this page on your phone</strong>
+    <div class="qr">
+      <img src="qr.svg" alt="QR code linking to https://bekov001.github.io/mlr-ex08/">
+      <a href="https://bekov001.github.io/mlr-ex08/">https://bekov001.github.io/mlr-ex08/</a>
+    </div>
+  </div>
+</main>
+
+<!-- ONNX Runtime Web, pinned version. The only external resource; the image never leaves the device. -->
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.min.js"></script>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const statusEl = $("status"), video = $("video"), photo = $("photo"), hint = $("hint");
+let session = null, info = null, stream = null, running = false, busy = false;
+
+function setStatus(text, isError = false) {
+  statusEl.textContent = text;
+  statusEl.className = isError ? "err" : "";
+}
+
+// Everything the model needs to be fed correctly comes from model_info.json.
+async function init() {
+  try {
+    info = await (await fetch("model_info.json")).json();
+    ort.env.wasm.wasmPaths = "https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/";
+    ort.env.wasm.numThreads = 1;   // no cross-origin isolation on GitHub Pages
+    session = await ort.InferenceSession.create("leaf_model.onnx", { executionProviders: ["wasm"] });
+    renderBars(info.classes.map(() => 0));
+    $("start").disabled = false;
+    $("check").disabled = false;
+    setStatus(`Model ready: ${info.classes.length} classes, input ${info.input_size}×${info.input_size}.`);
+  } catch (e) {
+    setStatus("Could not load the model: " + e.message, true);
+  }
+}
+
+// Preprocessing — identical to the notebook transform:
+// central square crop -> resize to input_size -> RGB / 255 -> (x - mean) / std -> NCHW float32.
+const canvas = document.createElement("canvas");
+const ctx = canvas.getContext("2d", { willReadFrequently: true });
+
+function toTensor(source, width, height) {
+  const size = info.input_size;
+  const side = Math.min(width, height);
+  const sx = (width - side) / 2, sy = (height - side) / 2;
+  canvas.width = size; canvas.height = size;
+  ctx.imageSmoothingEnabled = true;
+  ctx.imageSmoothingQuality = "high";
+  ctx.drawImage(source, sx, sy, side, side, 0, 0, size, size);
+  const rgba = ctx.getImageData(0, 0, size, size).data;
+  const plane = size * size;
+  const data = new Float32Array(3 * plane);
+  for (let i = 0; i < plane; i++) {
+    for (let c = 0; c < 3; c++) {
+      data[c * plane + i] = (rgba[4 * i + c] / 255 - info.mean[c]) / info.std[c];
+    }
+  }
+  return new ort.Tensor("float32", data, [1, 3, size, size]);
+}
+
+function softmax(logits) {
+  const max = Math.max(...logits);
+  const exps = logits.map((v) => Math.exp(v - max));
+  const sum = exps.reduce((a, b) => a + b, 0);
+  return exps.map((v) => v / sum);
+}
+
+async function classify(source, width, height) {
+  const tensor = toTensor(source, width, height);
+  const inputName = session.inputNames[0];
+  const out = await session.run({ [inputName]: tensor });
+  return softmax(Array.from(out[session.outputNames[0]].data));
+}
+
+function renderBars(probs) {
+  const best = probs.indexOf(Math.max(...probs));
+  $("bars").innerHTML = info.classes.map((name, i) =>
+    `<div class="row${i === best && probs[i] > 0 ? " top" : ""}"><span>${name}</span>` +
+    `<span class="bar"><i style="width:${(100 * probs[i]).toFixed(1)}%"></i></span>` +
+    `<span class="num">${(100 * probs[i]).toFixed(1)} %</span></div>`).join("");
+}
+
+async function tick() {
+  if (!running) return;
+  if (!busy && video.readyState >= 2 && video.videoWidth) {
+    busy = true;
+    const t0 = performance.now();
+    try {
+      renderBars(await classify(video, video.videoWidth, video.videoHeight));
+      $("timing").textContent = `inference ${(performance.now() - t0).toFixed(0)} ms`;
+    } catch (e) { setStatus("Inference failed: " + e.message, true); }
+    busy = false;
+  }
+  requestAnimationFrame(tick);
+}
+
+// iOS Safari: the camera may only be opened from a user gesture.
+async function startCamera() {
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      audio: false, video: { facingMode: { ideal: "environment" }, width: { ideal: 640 }, height: { ideal: 640 } },
+    });
+    video.srcObject = stream;
+    await video.play();
+    photo.hidden = true; video.hidden = false; hint.hidden = true;
+    $("start").disabled = true; $("stop").disabled = false;
+    running = true;
+    setStatus("Camera running — classifying live.");
+    requestAnimationFrame(tick);
+  } catch (e) {
+    setStatus("Camera not available (" + e.message + "). Use “Upload photo” instead.", true);
+  }
+}
+
+function stopCamera() {
+  running = false;
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  stream = null; video.hidden = true; hint.hidden = false;
+  $("start").disabled = false; $("stop").disabled = true;
+  setStatus("Camera stopped.");
+}
+
+function loadImage(url) {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("cannot read the image"));
+    img.src = url;
+  });
+}
+
+// Fallback: classify a photo from the gallery / camera app. It is decoded locally, never uploaded.
+$("upload").addEventListener("change", async (event) => {
+  const file = event.target.files[0];
+  if (!file || !session) return;
+  if (running) stopCamera();
+  const url = URL.createObjectURL(file);
+  try {
+    const img = await loadImage(url);
+    photo.src = url; photo.hidden = false; hint.hidden = true;
+    renderBars(await classify(img, img.naturalWidth, img.naturalHeight));
+    setStatus("Classified the uploaded photo: " + file.name);
+  } catch (e) {
+    setStatus("Could not classify the photo: " + e.message, true);
+  }
+  event.target.value = "";
+});
+
+$("check").addEventListener("click", async () => {
+  try {
+    const [img, expected] = await Promise.all([loadImage("check_image.jpg"), fetch("check_expected.json").then((r) => r.json())]);
+    const probs = await classify(img, img.naturalWidth, img.naturalHeight);
+    let worst = 0;
+    const rows = info.classes.map((name, i) => {
+      const diff = Math.abs(probs[i] - expected[name]);
+      worst = Math.max(worst, diff);
+      return `<tr><td>${name}</td><td>${probs[i].toFixed(4)}</td><td>${expected[name].toFixed(4)}</td><td>${diff.toFixed(4)}</td></tr>`;
+    }).join("");
+    $("checkOut").innerHTML = `<table><tr><th>class</th><th>page</th><th>notebook</th><th>|diff|</th></tr>${rows}</table>` +
+      `<p><strong>${worst < 0.0005 ? "✅ agrees to three decimals" : "⚠️ differs by " + worst.toFixed(4)}</strong></p>`;
+  } catch (e) {
+    $("checkOut").textContent = "Check failed: " + e.message;
+  }
+});
+
+$("start").addEventListener("click", startCamera);
+$("stop").addEventListener("click", stopCamera);
+document.addEventListener("visibilitychange", () => { if (document.hidden && running) stopCamera(); });
+init();
+</script>
+</body>
+</html>
